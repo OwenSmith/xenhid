@@ -112,6 +112,8 @@ AddDevice(
     PDEVICE_OBJECT          LowerDeviceObject;
     NTSTATUS                status;
 
+    ASSERT3P(__DriverGetDriverObject(), ==, DriverObject);
+
     Hid = DeviceObject->DeviceExtension;
     Fdo = Hid->MiniDeviceExtension;
     LowerDeviceObject = Hid->NextDeviceObject;

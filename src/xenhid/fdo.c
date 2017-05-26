@@ -47,12 +47,10 @@ struct _XENHID_FDO {
     PDEVICE_OBJECT          DeviceObject;
     PDEVICE_OBJECT          LowerDeviceObject;
     BOOLEAN                 Enabled;
-    BOOLEAN                 Running;
-
     XENHID_HID_INTERFACE    HidInterface;
-    IO_CSQ                  IrpQueue;
-    KSPIN_LOCK              IrpLock;
-    LIST_ENTRY              IrpList;
+    IO_CSQ                  Queue;
+    KSPIN_LOCK              Lock;
+    LIST_ENTRY              List;
 };
 
 ULONG
@@ -69,9 +67,9 @@ FdoCsqInsertIrp(
     IN  PIRP    Irp
     )
 {
-    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, IrpQueue);
+    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, Queue);
 
-    InsertTailList(&Fdo->IrpList, &Irp->Tail.Overlay.ListEntry);
+    InsertTailList(&Fdo->List, &Irp->Tail.Overlay.ListEntry);
 }
 
 VOID
@@ -80,9 +78,8 @@ FdoCsqRemoveIrp(
     IN  PIRP    Irp
     )
 {
-    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, IrpQueue);
+    UNREFERENCED_PARAMETER(Csq);
 
-    UNREFERENCED_PARAMETER(Fdo);
     RemoveEntryList(&Irp->Tail.Overlay.ListEntry);
 }
 
@@ -93,15 +90,19 @@ FdoCsqPeekNextIrp(
     IN  PVOID   Context
     )
 {
-    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, IrpQueue);
+    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, Queue);
     PLIST_ENTRY ListEntry;
     PIRP        NextIrp;
 
-    ListEntry = RemoveHeadList(&Fdo->IrpList);
-    if (ListEntry == &Fdo->IrpList)
-        return NULL;
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Irp == NULL)
+        ListEntry = Fdo->List.Flink;
+    else
+        ListEntry = Irp->Tail.Overlay.ListEntry.Flink;
 
     NextIrp = CONTAINING_RECORD(ListEntry, IRP, Tail.Overlay.ListEntry);
+    // should walk through the list until a match against Context is found
     return NextIrp;
 }
 
@@ -111,9 +112,9 @@ FdoCsqAcquireLock(
     OUT PKIRQL  Irql
     )
 {
-    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, IrpQueue);
+    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, Queue);
 
-    KeAcquireSpinLock(&Fdo->IrpLock, Irql);
+    KeAcquireSpinLock(&Fdo->Lock, Irql);
 }
 
 VOID
@@ -122,9 +123,10 @@ FdoCsqReleaseLock(
     IN  KIRQL   Irql
     )
 {
-    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, IrpQueue);
+    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, Queue);
 
-    KeReleaseSpinLock(&Fdo->IrpLock, Irql);
+#pragma warning(suppress:26110)
+    KeReleaseSpinLock(&Fdo->Lock, Irql);
 }
 
 VOID
@@ -133,9 +135,9 @@ FdoCsqCompleteCanceledIrp(
     IN  PIRP    Irp
     )
 {
-    PXENHID_FDO Fdo = CONTAINING_RECORD(Csq, XENHID_FDO, IrpQueue);
+    UNREFERENCED_PARAMETER(Csq);
 
-    UNREFERENCED_PARAMETER(Fdo);
+    Irp->IoStatus.Information = 0;
     Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
 }
@@ -148,13 +150,12 @@ FdoHidCallback(
     )
 {
     PXENHID_FDO     Fdo = Argument;
+    BOOLEAN         Completed = FALSE;
     PIRP            Irp;
 
-    Irp = IoCsqRemoveNextIrp(&Fdo->IrpQueue, NULL);
+    Irp = IoCsqRemoveNextIrp(&Fdo->Queue, NULL);
     if (Irp == NULL)
-        return FALSE;
-
-    Trace("=====>\n");
+        goto done;
 
     RtlCopyMemory(Irp->UserBuffer,
                   Buffer,
@@ -163,49 +164,10 @@ FdoHidCallback(
     Irp->IoStatus.Status = STATUS_SUCCESS;
 
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    Completed = TRUE;
 
-    Trace("<=====\n");
-    return TRUE;
-}
-
-static DECLSPEC_NOINLINE VOID
-FdoResume(
-    IN  PXENHID_FDO Fdo
-    )
-{
-    Trace("=====>\n");
-    if (Fdo->Running)
-        goto done;
-
-    Fdo->Running = TRUE;
 done:
-    Trace("<=====\n");
-}
-
-static DECLSPEC_NOINLINE VOID
-FdoSuspend(
-    IN  PXENHID_FDO Fdo
-    )
-{
-    Trace("=====>\n");
-    if (Fdo->Running)
-        goto done;
-
-    for (;;) {
-        PIRP        Irp;
-
-        Irp = IoCsqRemoveNextIrp(&Fdo->IrpQueue, NULL);
-        if (Irp == NULL)
-            break;
-
-        Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
-
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    }
-
-    Fdo->Running = FALSE;
-done:
-    Trace("<=====\n");
+    return Completed;
 }
 
 static DECLSPEC_NOINLINE NTSTATUS
@@ -216,6 +178,7 @@ FdoD3ToD0(
     NTSTATUS        status;
 
     Trace("=====>\n");
+
     if (Fdo->Enabled)
         goto done;
 
@@ -253,6 +216,7 @@ FdoD0ToD3(
     )
 {
     Trace("=====>\n");
+
     if (!Fdo->Enabled)
         goto done;
 
@@ -339,6 +303,79 @@ FdoForwardIrpSynchronously(
 }
 
 static DECLSPEC_NOINLINE NTSTATUS
+FdoStartDevice(
+    IN  PXENHID_FDO     Fdo,
+    IN  PIRP            Irp
+    )
+{
+    NTSTATUS            status;
+
+    status = FdoForwardIrpSynchronously(Fdo, Irp);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = FdoD3ToD0(Fdo);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = Irp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return status;
+
+fail2:
+    Error("fail2\n");
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    Irp->IoStatus.Status = status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return status;
+}
+
+static DECLSPEC_NOINLINE NTSTATUS
+FdoStopDevice(
+    IN  PXENHID_FDO Fdo,
+    IN  PIRP        Irp
+    )
+{
+    NTSTATUS        status;
+
+    FdoD0ToD3(Fdo);
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+
+    IoSkipCurrentIrpStackLocation(Irp);
+    status = IoCallDriver(Fdo->LowerDeviceObject, Irp);
+
+    return status;
+}
+
+static DECLSPEC_NOINLINE NTSTATUS
+FdoRemoveDevice(
+    IN  PXENHID_FDO Fdo,
+    IN  PIRP        Irp
+    )
+{
+    NTSTATUS        status;
+
+    ASSERT3U(KeGetCurrentIrql(), ==, PASSIVE_LEVEL);
+
+    FdoD0ToD3(Fdo);
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+
+    IoSkipCurrentIrpStackLocation(Irp);
+    status = IoCallDriver(Fdo->LowerDeviceObject, Irp);
+
+    FdoDestroy(Fdo);
+
+    return status;
+}
+
+static DECLSPEC_NOINLINE NTSTATUS
 FdoDispatchPnp(
     IN  PXENHID_FDO Fdo,
     IN  PIRP        Irp
@@ -348,82 +385,35 @@ FdoDispatchPnp(
     NTSTATUS            status;
 
     StackLocation = IoGetCurrentIrpStackLocation(Irp);
-    status = STATUS_SUCCESS;
 
     switch (StackLocation->MinorFunction) {
     case IRP_MN_START_DEVICE:
-        status = FdoForwardIrpSynchronously(Fdo, Irp);
-        if (!NT_SUCCESS(status))
-            return status;
-        status = FdoD3ToD0(Fdo);
-        return status;
+        status = FdoStartDevice(Fdo, Irp);
+        break;
 
     case IRP_MN_REMOVE_DEVICE:
-        FdoD0ToD3(Fdo);
+        status = FdoRemoveDevice(Fdo, Irp);
+        break;
+
+    case IRP_MN_STOP_DEVICE:
+        status = FdoStopDevice(Fdo, Irp);
         break;
 
     case IRP_MN_QUERY_STOP_DEVICE:
-        FdoSuspend(Fdo);
-        break;
-
     case IRP_MN_CANCEL_STOP_DEVICE:
-        FdoResume(Fdo);
-        break;
-
     case IRP_MN_QUERY_REMOVE_DEVICE:
-        FdoSuspend(Fdo);
-        break;
-
-    case IRP_MN_CANCEL_REMOVE_DEVICE:
-        FdoResume(Fdo);
-        break;
-
     case IRP_MN_SURPRISE_REMOVAL:
-        FdoD0ToD3(Fdo);
+    case IRP_MN_CANCEL_REMOVE_DEVICE:
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        IoSkipCurrentIrpStackLocation(Irp);
+        status = IoCallDriver(Fdo->LowerDeviceObject, Irp);
         break;
 
     default:
-        status = Irp->IoStatus.Status;
+        IoSkipCurrentIrpStackLocation(Irp);
+        status = IoCallDriver(Fdo->LowerDeviceObject, Irp);
         break;
     }
-
-    Irp->IoStatus.Status = status;
-
-    IoSkipCurrentIrpStackLocation(Irp);
-    status = IoCallDriver(Fdo->LowerDeviceObject, Irp);
-
-    return status;
-}
-
-static DECLSPEC_NOINLINE NTSTATUS
-FdoDispatchPower(
-    IN  PXENHID_FDO Fdo,
-    IN  PIRP        Irp
-    )
-{
-    PIO_STACK_LOCATION  StackLocation;
-    NTSTATUS            status;
-
-    StackLocation = IoGetCurrentIrpStackLocation(Irp);
-    switch (StackLocation->MinorFunction) {
-    case IRP_MN_SET_POWER:
-        if (StackLocation->Parameters.Power.Type != DevicePowerState)
-            break;
-
-        if (StackLocation->Parameters.Power.State.DeviceState == PowerDeviceD0)
-            FdoD3ToD0(Fdo);
-        else
-            FdoD0ToD3(Fdo);
-
-        break;
-
-    default:
-        break;
-    }
-
-    PoStartNextPowerIrp(Irp);
-    IoSkipCurrentIrpStackLocation(Irp);
-    status = PoCallDriver(Fdo->LowerDeviceObject, Irp);
 
     return status;
 }
@@ -546,8 +536,7 @@ FdoDispatchInternal(
 
     case IOCTL_HID_READ_REPORT:
         status = STATUS_PENDING;
-        IoMarkIrpPending(Irp);
-        IoCsqInsertIrp(&Fdo->IrpQueue, Irp, NULL);
+        IoCsqInsertIrp(&Fdo->Queue, Irp, NULL);
         XENHID_HID(ReadReport,
                    &Fdo->HidInterface);
         break;
@@ -590,10 +579,6 @@ FdoDispatch(
 
     case IRP_MJ_PNP:
         status = FdoDispatchPnp(Fdo, Irp);
-        break;
-
-    case IRP_MJ_POWER:
-        status = FdoDispatchPower(Fdo, Irp);
         break;
 
     default:
@@ -679,10 +664,10 @@ FdoCreate(
     Fdo->DeviceObject = DeviceObject;
     Fdo->LowerDeviceObject = LowerDeviceObject;
 
-    InitializeListHead(&Fdo->IrpList);
-    KeInitializeSpinLock(&Fdo->IrpLock);
+    InitializeListHead(&Fdo->List);
+    KeInitializeSpinLock(&Fdo->Lock);
 
-    status = IoCsqInitialize(&Fdo->IrpQueue,
+    status = IoCsqInitialize(&Fdo->Queue,
                              FdoCsqInsertIrp,
                              FdoCsqRemoveIrp,
                              FdoCsqPeekNextIrp,
@@ -702,13 +687,13 @@ FdoCreate(
 fail2:
     Error("fail2\n");
 
-    RtlZeroMemory(&Fdo->IrpQueue, sizeof(IO_CSQ));
+    RtlZeroMemory(&Fdo->Queue, sizeof(IO_CSQ));
 
 fail1:
     Error("fail1 %08x\n", status);
 
-    RtlZeroMemory(&Fdo->IrpList, sizeof(LIST_ENTRY));
-    RtlZeroMemory(&Fdo->IrpLock, sizeof(KSPIN_LOCK));
+    RtlZeroMemory(&Fdo->List, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Fdo->Lock, sizeof(KSPIN_LOCK));
 
     Fdo->DeviceObject = NULL;
     Fdo->LowerDeviceObject = NULL;
@@ -726,9 +711,9 @@ FdoDestroy(
 
     RtlZeroMemory(&Fdo->HidInterface,
                   sizeof(XENHID_HID_INTERFACE));
-    RtlZeroMemory(&Fdo->IrpQueue, sizeof(IO_CSQ));
-    RtlZeroMemory(&Fdo->IrpList, sizeof(LIST_ENTRY));
-    RtlZeroMemory(&Fdo->IrpLock, sizeof(KSPIN_LOCK));
+    RtlZeroMemory(&Fdo->Queue, sizeof(IO_CSQ));
+    RtlZeroMemory(&Fdo->List, sizeof(LIST_ENTRY));
+    RtlZeroMemory(&Fdo->Lock, sizeof(KSPIN_LOCK));
 
     Fdo->DeviceObject = NULL;
     Fdo->LowerDeviceObject = NULL;
